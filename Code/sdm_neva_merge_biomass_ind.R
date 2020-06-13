@@ -404,7 +404,7 @@ pred.dat<- bind_rows(pred.dat.f, pred.dat.s)
 rescaled.dat<- bind_rows(rescaled.dat.f, rescaled.dat.s)
 
 # Bring in vulnerability assessment datasets
-dir.dat<- read.csv(here:here("Data", "JHareDirectionalEffect.csv")) %>%
+dir.dat<- read.csv(here::here("Data", "JHareDirectionalEffect.csv")) %>%
   mutate(., "COMNAME" = toupper(Species)) %>%
   dplyr::select(., -Species) %>%
   group_by(COMNAME) %>%
@@ -1293,7 +1293,7 @@ saveRDS(result, file = paste(out.dir, "SDMPredictions.rds", sep = ""))
 
 # Results — Filtering, always run -----------------------------------------------
 # Real data
-mod.res<- read_csv(paste(out.dir, "mod.results.csv", sep = "")) %>%
+mod.res<- read_csv(paste(out.dir, "/mod.results.csv", sep = "")) %>%
   drop_na(RMSE.SDM.B, CorrCoeff.SDM.B, Bias.SDM.B, RMSE.NEVA.B, CorrCoeff.NEVA.B, Bias.NEVA.B)
 
 # Exploring cut offs... AUC > 0.7 in both seasons
@@ -1577,7 +1577,6 @@ res.plot.south<- res.plot %>%
 
 res.plot.all<- list(res.plot.nelme, res.plot.gom, res.plot.south)
 names(res.plot.all)<- c("NELME", "GoM", "South")
-
 
 ## Climate variability across the shelf by season
 df<- data.frame(res.plot.all[[1]])
