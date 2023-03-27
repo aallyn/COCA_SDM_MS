@@ -8,6 +8,8 @@ library(zoo)
 library(rgeos)
 library(mgcv)
 library(tidync)
+library(rgeos)
+library(zoo)
 
 # New SF nonsense
 sf_use_s2(FALSE)
@@ -94,23 +96,123 @@ base.temp.sd.sp<- sd(dat.train.s$SEASONALMU.OISST, na.rm = T)
 spring.rescale.df<- data.frame(SEASON = "SPRING", mean.t = base.temp.mean.sp, sd.t = base.temp.sd.sp, mean.depth = base.depth.mean.sp, sd.depth = base.depth.sd.sp, mean.shelf = base.shelf.mean.sp, sd.shelf = base.shelf.sd.sp)
 
 ## Getting the future projected temperatures
-seasons<- c("Spring", "Fall")
-season <- seasons[2]
-
-## Projections
 proj.wgs84<- CRS("+init=epsg:4326") #WGS84
 proj.utm<- CRS("+init=epsg:2960") #UTM 19
+
+#Bounds
+xlim.use<- c(-77, -65)
+ylim.use<- c(35.05, 45.2)
+
+states <- c("Maine", "New Hampshire", "Massachusetts", "Vermont", "New York", "Rhode Island", "Connecticut", "Delaware", "New Jersey", "Maryland", "Pennsylvania", "Virginia", "North Carolina", "South Carolina", "Georgia", "Florida", "District of Columbia", "West Virgina")
+provinces <- c("Ontario", "Québec", "Nova Scotia", "New Brunswick")
+
+us <- raster::getData("GADM",country="USA",level=1)
+us.states <- us[us$NAME_1 %in% states,]
+us.states <- gSimplify(us.states, tol = 0.075, topologyPreserve = TRUE)
+canada <- raster::getData("GADM",country="CAN",level=1)
+ca.provinces <- canada[canada$NAME_1 %in% provinces,]
+ca.provinces <- gSimplify(ca.provinces, tol = 0.075, topologyPreserve = TRUE)
+
+us.states.f<- fortify(us.states, NAME_1)
+ca.provinces.f<- fortify(ca.provinces, NAME_1)
+
+### Applying anomalies -- mean
+## Inspect the file using the ncdf4 libaray
+## Get sst anomaly 
+sst.anom.temp<- raster::stack("~/Github/COCA_SDM_MS/Data/SST.CMIP5.1982-2099.anom.nc", varname = "sstanom")
+sst.anom<- raster::rotate(sst.anom.temp)
+
+## Get oisst data
+oisst.dat.temp<- raster::stack("/Users/aallyn/Library/CloudStorage/Box-Box/Mills Lab/Projects/COCA15_ClimVuln/COCA-SDM/Data/EC_sst_1981_2015_OISST-V2-AVHRR_agg_combined.nc", varname = "sst")
+oisst.dat<- raster::rotate(oisst.dat.temp)
+
+# Need to get climatology from the OISST data -- set up OISST stack as time series
+oisst.min<- gsub("X", "", min(names(oisst.dat)))
+oisst.min.date<- as.Date(gsub("[.]", "-", oisst.min))
+oisst.max<- gsub("X", "", max(names(oisst.dat)))
+oisst.max.date<- as.Date(gsub("[.]", "-", oisst.max))
+
+# Calculate monthly mean temperature -- this would be compared to the sstclim data (monthly climate ensemble)
+oisst.dates<- seq.Date(from = oisst.min.date, to = oisst.max.date, by = "day")
+oisst.dat<- setZ(oisst.dat, oisst.dates)
+
+# Aggregate daily to monthly data
+oisst.monthly <- zApply(oisst.dat, by = as.yearmon, mean)
+
+# Lets check that
+test.dat<- subset(oisst.dat, which(getZ(oisst.dat) >="1981-09-01" & getZ(oisst.dat) <= "1981-09-30"))
+sept1981.mu<- calc(test.dat, mean)
+plot(oisst.monthly[[1]]-sept1981.mu)
+
+# Everything seems fine there, now need the monthly average for each month across baseline years (1982-2011)
+dates<- getZ(oisst.monthly)
+subset.vec<- which(dates > "Dec 1981" & dates < "Jan 2012", arr.ind = TRUE)
+oisst.monthly.sub<- oisst.monthly[[subset.vec]]
+oisst.monthly.sub<- setZ(oisst.monthly.sub, dates[subset.vec])
+
+oisst.clim<- stack()
+months<- c("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
+
+for(i in seq_along(months)) {
+  # Get all the monthly raster
+  stack.temp<- subset(oisst.monthly.sub, which(grepl(months[i], names(oisst.monthly.sub))))
+  month.clim<- calc(stack.temp, fun = mean)
+  oisst.clim<- stack(oisst.clim, month.clim)
+  names(oisst.clim)[i]<- months[i]
+}
+
+# Check that
+test.dat<- subset(oisst.monthly.sub, which(grepl("Jan", names(oisst.monthly.sub))))
+jan.mu<- calc(test.dat, mean)
+summary(oisst.clim[[1]] - jan.mu)
+
+# Looks good -- time to apply the anomalies to the oisst.clim
+oisst.clim.coarse<- raster::resample(oisst.clim, sst.anom)
+names(oisst.clim.coarse)<- c("01", "02", "03", "04", "05", "06", "07", "08", "09", "10", "11", "12")
+
+# Okay, now good to apply the anomalies from the climate models to climatology and get raw values
+sst.model<- stack()
+
+for(i in 1:nlayers(sst.anom)) {
+  index.match<- which(gsub("X", "", names(oisst.clim.coarse)) == unlist(strsplit(names(sst.anom)[i], "[.]"))[2])
+  rast.temp<- oisst.clim.coarse[[index.match]] + sst.anom[[i]]
+  sst.model<- stack(sst.model, rast.temp)
+  names(sst.model)[i]<- names(sst.anom)[i]
+}
+
+# One more step, need to fill in the missing coastline raster cell values.... Function below, i is corresponding to a three by three window
+fill.na <- function(x, i=5) {
+  if( is.na(x)[i] ) {
+    return( round(mean(x, na.rm=TRUE),0) )
+  } else {
+    return( round(x[i],0) )
+  }
+}  
+
+# Now apply that function to each raster stack
+for(i in 1:nlayers(sst.model)) {
+  new.rast<- focal(sst.model[[i]], w = matrix(1, 3, 3), fun = fill.na, pad = TRUE, na.rm = FALSE)
+  sst.model[[i]]<- new.rast
+}
+
+sst.model.proj<- projectRaster(sst.model, crs = proj.utm)
+names(sst.model.proj)<- names(sst.anom)
+sst.model<- projectRaster(sst.model.proj, crs = proj.wgs84)
+
+## Update season
+seasons<- c("Spring", "Fall")
+season <- seasons[2]
   
 # Empty stack
 pred.rast.stack<- stack()
   
 # Add OISST
 name.ind<- nlayers(pred.rast.stack)+1
-stack0<- raster::stack(oisst.dir)
+stack0<- oisst.dat
   
 # Move to monthly?
 oisst.min.date<- as.Date("1981-09-01")
-oisst.max.date<- as.Date("2020-03-09")
+oisst.max.date<- as.Date("2015-12-16")
   
 # Calculate monthly mean temperature -- this would be compared to the sstclim data (monthly climate ensemble)
 oisst.dates<- seq.Date(from = oisst.min.date, to = oisst.max.date, by = "day")
@@ -122,14 +224,13 @@ oisst.monthly <- zApply(oisst.dat, by = as.yearmon, mean)
 # Basline
 sst.stack<- stack()
 
-years<- c("2014", "2015", "2016", "2017", "2018")
+years<- c("2011", "2012", "2013", "2014", "2015")
 
 for(i in seq_along(years)){
     
     dates.use<- switch(season,
                          "Fall" = paste(c("Sep", "Oct", "Nov"), rep(years[i]), sep = "."),
-                         "Spring" = paste(c("Mar", "Apr", "May"), rep(years[i]), sep = "."),
-                         "Summer" = paste(c("Jun", "Jul", "Aug", "Sep"), rep(years[i]), sep = "."))
+                         "Spring" = paste(c("Mar", "Apr", "May"), rep(years[i]), sep = "."))
     
     sst.temp<- calc(oisst.monthly[[which(names(oisst.monthly) %in% dates.use)]], mean)
     
@@ -145,10 +246,10 @@ names(pred.rast.stack)[c(1)]<- c("Baseline")
 
 # Climate
 name.ind <- nlayers(pred.rast.stack) + 1
-stack0<- stack(rcp85.mu.dir)
+stack0<- sst.model
 proj4string(stack0)<- proj.wgs84
 stack0<- resample(stack0, oisst.monthly[[1]])
-clim.dates <- seq.Date(from = as.Date("1980-01-16"), to = as.Date("2060-01-16"), by = "month")
+clim.dates <- as.Date(names(stack0), format = "X%Y.%m.%d")
 clim.stack <- setZ(stack0, clim.dates)
 clim.stack.zind<- getZ(clim.stack)
 
@@ -161,8 +262,7 @@ for(i in seq_along(years)){
     
     dates.use<- switch(season,
                           "Fall" = as.Date(paste(rep(years[i]), c("09-16", "10-16", "11-16"), sep = "-")),
-                          "Spring" = as.Date(paste(rep(years[i]), c("03-16", "04-16", "05-16"), sep = "-")),
-                         "Summer" = as.Date(paste(rep(years[i]), c("06-16", "07-16", "08-16", "09-16"), sep = "-")))
+                          "Spring" = as.Date(paste(rep(years[i]), c("03-16", "04-16", "05-16"), sep = "-")))
     clim.mu.temp<- calc(clim.stack[[which(clim.stack.zind %in% dates.use)]], mean)
      
     rcp85.mu.stack<- stack(rcp85.mu.stack, clim.mu.temp)
@@ -227,8 +327,13 @@ temp.scale<- function(new.temp, base.temp.mean, base.temp.sd){
   }
 }
 
-spring.preds<- readRDS("/Users/aallyn/Library/CloudStorage/Box-Box/Mills Lab/Projects/COCA15_ClimVuln/COCA-SDM/Data/spring.rast.preds.DisMap.rds")
-fall.preds<- readRDS("/Users/aallyn/Library/CloudStorage/Box-Box/Mills Lab/Projects/COCA15_ClimVuln/COCA-SDM/Data/fall.rast.preds.DisMap.rds")
+spring.preds<- readRDS("/Users/aallyn/Library/CloudStorage/Box-Box/Mills Lab/Projects/COCA15_ClimVuln/COCA-SDM/Data/spring.rast.preds.DisMap.rds") 
+spring.preds$DEPTH <- ifelse(spring.preds$DEPTH < -500, NA, spring.preds$DEPTH)
+spring.preds$DEPTH <- ifelse(spring.preds$DEPTH > 0, NA, spring.preds$DEPTH)
+
+fall.preds <- readRDS("/Users/aallyn/Library/CloudStorage/Box-Box/Mills Lab/Projects/COCA15_ClimVuln/COCA-SDM/Data/fall.rast.preds.DisMap.rds")
+fall.preds$DEPTH <- ifelse(fall.preds$DEPTH < -500, NA, fall.preds$DEPTH)
+fall.preds$DEPTH <- ifelse(fall.preds$DEPTH > 0, NA, fall.preds$DEPTH)
 
 base.preds.sp<- spring.preds %>%
   dplyr::select(., x, y, Baseline, DEPTH) %>%
@@ -386,9 +491,9 @@ for(i in seq_along(spp)){
 
   # Get species raster layers from full stack
   raster.temp<- results.stack[[which(grepl(spp.use, names(results.stack)))]]
-  na.value<- -99999
-  raster.temp[is.na(raster.temp)]<- na.value
-  raster.temp[is.infinite(raster.temp)]<- na.value
+  # na.value<- -99999
+  # raster.temp[is.na(raster.temp)]<- na.value
+  # raster.temp[is.infinite(raster.temp)]<- na.value
   raster.out <- raster.temp
   proj4string(raster.out) <- proj.wgs84
 
@@ -396,7 +501,7 @@ for(i in seq_along(spp)){
   names_use_temp <- do.call("rbind", lapply(names_list, "[", c(4, 5)))
   names_use <- paste(names_use_temp[, 1], names_use_temp[, 2], sep = "_")
   names(raster.out) <- names_use
-  writeRaster(raster.out, out.file.use, overwrite = TRUE, format = "CDF", varname = "Biomass", varunit = "kg*tow-1", longname = "Predicted biomass (kg*tow-1)", xname = "Longitude", yname = "Latitude", zname = "Time (Season-Year)"
+  writeRaster(raster.out, out.file.use, overwrite = TRUE, format = "CDF", varname = "Biomass", varunit = "kg*tow-1", longname = "Predicted biomass (kg*tow-1)", xname = "Longitude", yname = "Latitude", zname = "Time", zunit = "Season-Year"
     )
 
   # print
@@ -407,7 +512,14 @@ for(i in seq_along(spp)){
 t <- tidync(out.file.use)
 hyper_grids(t)
 
-
+i = 3
+# Get species, set netcdf file title and output
+  spp.use<- spp[i]
+  title.use<- gsub("[.]",  " ", str_to_sentence(spp.use))
+  out.file.use<- paste(out.file.stem, title.use, ".nc", sep = "")
+t2 <- raster::stack(out.file.use)
+t2
+plot(t2[[78]])
 
 
 
